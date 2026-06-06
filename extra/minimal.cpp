@@ -20,7 +20,7 @@
 #define NUM_RUNS 10
 #define SIZE 4096
 
-// --- 2D Register Blocking Parameters ---
+// --- 2D Register Blocking + Local Register Caching Parameters ---
 #define TS 32
 #define WPT 4
 #define RTS (TS/WPT)
@@ -29,7 +29,7 @@ const char *kernelstring =
     "#define TS 32\n"
     "#define WPT 4\n"
     "#define RTS (TS/WPT)\n"
-    "__kernel void myGEMM6(const int M, const int N, const int K,"
+    "__kernel void myGEMM7(const int M, const int N, const int K,"
     "                      const __global float* A,"
     "                      const __global float* B,"
     "                      __global float* C) {"
@@ -58,13 +58,42 @@ const char *kernelstring =
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
     "        \n"
-    "        // Perform the MAC operations\n"
+    "        // Perform the MAC operations with explicit register caching\n"
     "        for (int k=0; k<TS; k++) {"
-    "            for (int wm=0; wm<WPT; wm++) {"
-    "                for (int wn=0; wn<WPT; wn++) {"
-    "                    acc[wm][wn] += Asub[k][row + wm*RTS] * Bsub[col + wn*RTS][k];"
-    "                }"
-    "            }"
+    "            float a_reg[WPT];\n"
+    "            float b_reg[WPT];\n"
+    "            \n"
+    "            // Read from local memory to private registers ONLY ONCE per k\n"
+    "            a_reg[0] = Asub[k][row + 0*RTS];\n"
+    "            a_reg[1] = Asub[k][row + 1*RTS];\n"
+    "            a_reg[2] = Asub[k][row + 2*RTS];\n"
+    "            a_reg[3] = Asub[k][row + 3*RTS];\n"
+    "            \n"
+    "            b_reg[0] = Bsub[col + 0*RTS][k];\n"
+    "            b_reg[1] = Bsub[col + 1*RTS][k];\n"
+    "            b_reg[2] = Bsub[col + 2*RTS][k];\n"
+    "            b_reg[3] = Bsub[col + 3*RTS][k];\n"
+    "            \n"
+    "            // 16 Explicit MAC operations entirely in registers\n"
+    "            acc[0][0] += a_reg[0] * b_reg[0];\n"
+    "            acc[0][1] += a_reg[0] * b_reg[1];\n"
+    "            acc[0][2] += a_reg[0] * b_reg[2];\n"
+    "            acc[0][3] += a_reg[0] * b_reg[3];\n"
+    "            \n"
+    "            acc[1][0] += a_reg[1] * b_reg[0];\n"
+    "            acc[1][1] += a_reg[1] * b_reg[1];\n"
+    "            acc[1][2] += a_reg[1] * b_reg[2];\n"
+    "            acc[1][3] += a_reg[1] * b_reg[3];\n"
+    "            \n"
+    "            acc[2][0] += a_reg[2] * b_reg[0];\n"
+    "            acc[2][1] += a_reg[2] * b_reg[1];\n"
+    "            acc[2][2] += a_reg[2] * b_reg[2];\n"
+    "            acc[2][3] += a_reg[2] * b_reg[3];\n"
+    "            \n"
+    "            acc[3][0] += a_reg[3] * b_reg[0];\n"
+    "            acc[3][1] += a_reg[3] * b_reg[1];\n"
+    "            acc[3][2] += a_reg[3] * b_reg[2];\n"
+    "            acc[3][3] += a_reg[3] * b_reg[3];\n"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
     "    }\n"
@@ -132,7 +161,7 @@ int main(int argc, char* argv[]) {
     clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, (size_t)K*(size_t)N*sizeof(float), B, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
-    cl_kernel kernel = clCreateKernel(program, "myGEMM6", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM7", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
@@ -149,7 +178,6 @@ int main(int argc, char* argv[]) {
     for (int r=0; r<NUM_RUNS; r++) {
         auto run_start = std::chrono::high_resolution_clock::now();
 
-        // 2D register blocking requires updated local and global workgroup sizes
         const size_t local[2] = { (size_t)RTS, (size_t)RTS };
         const size_t global[2] = { (size_t)(M / WPT), (size_t)(N / WPT) };
 
