@@ -19,14 +19,17 @@
 
 #define NUM_RUNS 10
 #define SIZE 4096
-#define TS 16
-#define WPT 8
+
+// --- 2D Register Blocking Parameters ---
+#define TS 32
+#define WPT 4
+#define RTS (TS/WPT)
 
 const char *kernelstring =
-    "#define TS 16\n"
-    "#define WPT 8\n"
+    "#define TS 32\n"
+    "#define WPT 4\n"
     "#define RTS (TS/WPT)\n"
-    "__kernel void myGEMM5(const int M, const int N, const int K,"
+    "__kernel void myGEMM6(const int M, const int N, const int K,"
     "                      const __global float* A,"
     "                      const __global float* B,"
     "                      __global float* C) {"
@@ -35,32 +38,41 @@ const char *kernelstring =
     "    const int globalRow = TS*get_group_id(0) + row;"
     "    const int globalCol = TS*get_group_id(1) + col;"
     "    __local float Asub[TS][TS];"
-    "    // Искусственный сдвиг (padding) на 1 элемент для устранения Bank Conflicts\n"
-    "    __local float Bsub[TS][TS + 1];"
-    "    float acc[WPT];"
-    "    for (int w=0; w<WPT; w++) {"
-    "        acc[w] = 0.0f;"
-    "    }"
+    "    __local float Bsub[TS][TS];"
+    "    float acc[WPT][WPT];"
+    "    \n"
+    "    // Initialise the accumulation registers\n"
+    "    for (int wm=0; wm<WPT; wm++) {"
+    "        for (int wn=0; wn<WPT; wn++) {"
+    "            acc[wm][wn] = 0.0f;"
+    "        }"
+    "    }\n"
     "    const int numTiles = K/TS;"
     "    for (int t=0; t<numTiles; t++) {"
-    "        for (int w=0; w<WPT; w++) {"
-    "            const int tiledRow = TS*t + row;"
-    "            const int tiledCol = TS*t + col + w*RTS;"
-    "            Asub[col + w*RTS][row] = A[(tiledCol)*M + globalRow];"
-    "            // Транспонирование B: записываем в [row][col], а не [col][row]\n"
-    "            Bsub[row][col + w*RTS] = B[(globalCol + w*RTS)*K + tiledRow];"
-    "        }"
-    "        barrier(CLK_LOCAL_MEM_FENCE);"
-    "        for (int k=0; k<TS; k++) {"
-    "            for (int w=0; w<WPT; w++) {"
-    "                // Теперь считываем Bsub по строкам [k][col], что гораздо быстрее\n"
-    "                acc[w] += Asub[k][row] * Bsub[k][col + w*RTS];"
+    "        // Load the current tile into local memory\n"
+    "        for (int wm=0; wm<WPT; wm++) {"
+    "            for (int wn=0; wn<WPT; wn++) {"
+    "                Asub[col + wn*RTS][row + wm*RTS] = A[(TS*t + col + wn*RTS)*M + globalRow + wm*RTS];"
+    "                Bsub[col + wn*RTS][row + wm*RTS] = B[(globalCol + wn*RTS)*K + TS*t + row + wm*RTS];"
     "            }"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
-    "    }"
-    "    for (int w=0; w<WPT; w++) {"
-    "        C[(globalCol + w*RTS)*M + globalRow] = acc[w];"
+    "        \n"
+    "        // Perform the MAC operations\n"
+    "        for (int k=0; k<TS; k++) {"
+    "            for (int wm=0; wm<WPT; wm++) {"
+    "                for (int wn=0; wn<WPT; wn++) {"
+    "                    acc[wm][wn] += Asub[k][row + wm*RTS] * Bsub[col + wn*RTS][k];"
+    "                }"
+    "            }"
+    "        }"
+    "        barrier(CLK_LOCAL_MEM_FENCE);"
+    "    }\n"
+    "    // Store the results\n"
+    "    for (int wm=0; wm<WPT; wm++) {"
+    "        for (int wn=0; wn<WPT; wn++) {"
+    "            C[(globalCol + wn*RTS)*M + globalRow + wm*RTS] = acc[wm][wn];"
+    "        }"
     "    }"
     "}";
 
@@ -120,7 +132,7 @@ int main(int argc, char* argv[]) {
     clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, (size_t)K*(size_t)N*sizeof(float), B, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
-    cl_kernel kernel = clCreateKernel(program, "myGEMM5", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM6", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
@@ -137,9 +149,15 @@ int main(int argc, char* argv[]) {
     for (int r=0; r<NUM_RUNS; r++) {
         auto run_start = std::chrono::high_resolution_clock::now();
 
-        const size_t local[2] = { TS, (size_t)(TS / WPT) };
-        const size_t global[2] = { (size_t)M, (size_t)(N / WPT) };
+        // 2D register blocking requires updated local and global workgroup sizes
+        const size_t local[2] = { (size_t)RTS, (size_t)RTS };
+        const size_t global[2] = { (size_t)(M / WPT), (size_t)(N / WPT) };
+
         err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &event);
+        if (err != CL_SUCCESS) {
+            printf("ERROR: Failed to enqueue kernel! Error code: %d\n", err);
+            return 1;
+        }
         clWaitForEvents(1, &event);
 
         auto run_end = std::chrono::high_resolution_clock::now();
