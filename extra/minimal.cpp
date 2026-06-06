@@ -12,77 +12,34 @@
 // g++ -O3 -Wall -std=c++11 extra/minimal.cpp -o bin/minimal -lOpenCL
 // =================================================================================================
 
-// Includes
 #include <stdio.h>
 #include <stdlib.h>
 #include <chrono>
 #include <CL/cl.h>
 
-// =================================================================================================
-
-// Increase the number of runs for better timing accuracy
 #define NUM_RUNS 10
-
-// Size of the matrices - K, M, N (squared)
 #define SIZE 4096
+#define TS 16
 
-// Threadblock sizes (e.g. for kernels myGEMM1 or myGEMM2)
-#define TS 16 // Set to 16 for AMD compatibility
-#define WPT 8 // Work Per Thread
-
-// =================================================================================================
-
-// Set the kernel as a string
 const char *kernelstring =
-    "#define TS 16\n"
-    "#define WPT 8\n"
-    "#define RTS (TS/WPT)\n"
-    "__kernel void myGEMM3(const int M, const int N, const int K,"
+    "__kernel void myGEMM1(const int M, const int N, const int K,"
     "                      const __global float* A,"
     "                      const __global float* B,"
     "                      __global float* C) {"
-    "    const int row = get_local_id(0);"
-    "    const int col = get_local_id(1);"
-    "    const int globalRow = TS*get_group_id(0) + row;"
-    "    const int globalCol = TS*get_group_id(1) + col;"
-    "    __local float Asub[TS][TS];"
-    "    __local float Bsub[TS][TS];"
-    "    float acc[WPT];"
-    "    for (int w=0; w<WPT; w++) {"
-    "        acc[w] = 0.0f;"
+    "    const int globalRow = get_global_id(0);"
+    "    const int globalCol = get_global_id(1);"
+    "    float acc = 0.0f;"
+    "    for (int k=0; k<K; k++) {"
+    "        acc += A[k*M + globalRow] * B[globalCol*K + k];"
     "    }"
-    "    const int numTiles = K/TS;"
-    "    for (int t=0; t<numTiles; t++) {"
-    "        for (int w=0; w<WPT; w++) {"
-    "            const int tiledRow = TS*t + row;"
-    "            const int tiledCol = TS*t + col + w*RTS;"
-    "            Asub[col + w*RTS][row] = A[(tiledCol)*M + globalRow];"
-    "            Bsub[col + w*RTS][row] = B[(globalCol + w*RTS)*K + tiledRow];"
-    "        }"
-    "        barrier(CLK_LOCAL_MEM_FENCE);"
-    "        for (int k=0; k<TS; k++) {"
-    "            for (int w=0; w<WPT; w++) {"
-    "                acc[w] += Asub[k][row] * Bsub[col + w*RTS][k];"
-    "            }"
-    "        }"
-    "        barrier(CLK_LOCAL_MEM_FENCE);"
-    "    }"
-    "    for (int w=0; w<WPT; w++) {"
-    "        C[(globalCol + w*RTS)*M + globalRow] = acc[w];"
-    "    }"
+    "    C[globalCol*M + globalRow] = acc;"
     "}";
 
-// =================================================================================================
-
-// Matrix-multiplication using a custom OpenCL SGEMM kernel.
 int main(int argc, char* argv[]) {
-
-    // Set the sizes
     int K = SIZE;
     int M = SIZE;
     int N = SIZE;
 
-    // Create the matrices and initialize them with random values
     float* A = (float*)malloc((size_t)M*(size_t)K*sizeof(float));
     float* B = (float*)malloc((size_t)K*(size_t)N*sizeof(float));
     float* C = (float*)malloc((size_t)M*(size_t)N*sizeof(float));
@@ -90,15 +47,10 @@ int main(int argc, char* argv[]) {
     for (int i=0; i<K*N; i++) { B[i] = 1.2*i + 0.01*i*i + 13.9; }
     for (int i=0; i<M*N; i++) { C[i] = 0.0; }
 
-    // Configure the OpenCL environment
     printf(">>> Initializing OpenCL...\n");
-
     cl_uint num_platforms;
     clGetPlatformIDs(0, NULL, &num_platforms);
-    if (num_platforms == 0) {
-        printf("ERROR: No OpenCL platforms found.\n");
-        return 1;
-    }
+    if (num_platforms == 0) return 1;
 
     cl_platform_id* platforms = (cl_platform_id*)malloc(num_platforms * sizeof(cl_platform_id));
     clGetPlatformIDs(num_platforms, platforms, NULL);
@@ -107,7 +59,6 @@ int main(int argc, char* argv[]) {
     cl_platform_id selected_platform = 0;
     char deviceName[1024];
 
-    // Find the first platform that contains a GPU device
     for (cl_uint i = 0; i < num_platforms; i++) {
         cl_int err = clGetDeviceIDs(platforms[i], CL_DEVICE_TYPE_GPU, 1, &device, NULL);
         if (err == CL_SUCCESS) {
@@ -118,62 +69,29 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    if (device == 0) {
-        printf("ERROR: No GPU device found on any platform.\n");
-        free(platforms);
-        return 1;
-    }
+    if (device == 0) { free(platforms); return 1; }
     free(platforms);
 
-    // Create context strictly tied to the selected AMD platform
-    cl_context_properties props[] = {
-        CL_CONTEXT_PLATFORM, (cl_context_properties)selected_platform,
-        0
-    };
-
+    cl_context_properties props[] = { CL_CONTEXT_PLATFORM, (cl_context_properties)selected_platform, 0 };
     cl_int err;
     cl_context context = clCreateContext(props, 1, &device, NULL, NULL, &err);
-    if (err != CL_SUCCESS) {
-        printf("ERROR: Failed to create context! Error code: %d\n", err);
-        return 1;
-    }
+    if (err != CL_SUCCESS) return 1;
 
     cl_command_queue queue = clCreateCommandQueue(context, device, 0, &err);
     cl_event event = NULL;
 
-    // Compile the kernel
     cl_program program = clCreateProgramWithSource(context, 1, &kernelstring, NULL, NULL);
-    cl_int build_err = clBuildProgram(program, 1, &device, "", NULL, NULL);
+    clBuildProgram(program, 1, &device, "", NULL, NULL);
 
-    // Check for compilation errors
-    if (build_err != CL_SUCCESS) {
-        size_t logSize;
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, NULL, &logSize);
-        char* messages = (char*)malloc((1+logSize)*sizeof(char));
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logSize, messages, NULL);
-        messages[logSize] = '\0';
-        printf(">>> BUILD ERROR LOG:\n%s\n", messages);
-        free(messages);
-        return 1;
-    }
-
-    // Prepare OpenCL memory objects
     cl_mem bufA = clCreateBuffer(context, CL_MEM_READ_ONLY,  (size_t)M*(size_t)K*sizeof(float), NULL, &err);
     cl_mem bufB = clCreateBuffer(context, CL_MEM_READ_ONLY,  (size_t)K*(size_t)N*sizeof(float), NULL, &err);
     cl_mem bufC = clCreateBuffer(context, CL_MEM_READ_WRITE, (size_t)M*(size_t)N*sizeof(float), NULL, &err);
 
-    if (err != CL_SUCCESS) {
-        printf("ERROR: Failed to allocate memory on GPU! Error code: %d\n", err);
-        return 1;
-    }
-
-    // Copy matrices to the GPU
     clEnqueueWriteBuffer(queue, bufA, CL_TRUE, 0, (size_t)M*(size_t)K*sizeof(float), A, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, (size_t)K*(size_t)N*sizeof(float), B, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
-    // Configure the myGEMM kernel and set its arguments
-    cl_kernel kernel = clCreateKernel(program, "myGEMM3", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM1", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
@@ -181,7 +99,6 @@ int main(int argc, char* argv[]) {
     clSetKernelArg(kernel, 4, sizeof(cl_mem), (void*)&bufB);
     clSetKernelArg(kernel, 5, sizeof(cl_mem), (void*)&bufC);
 
-    // Start the timed loop
     printf(">>> Starting %d myGEMM runs...\n", NUM_RUNS);
 
     double total_time = 0.0;
@@ -189,20 +106,11 @@ int main(int argc, char* argv[]) {
     double max_time = 0.0;
 
     for (int r=0; r<NUM_RUNS; r++) {
-
         auto run_start = std::chrono::high_resolution_clock::now();
 
-        // Run the myGEMM kernel
-        const size_t local[2] = { TS, (size_t)(TS / WPT) };
-        const size_t global[2] = { (size_t)M, (size_t)(N / WPT) };
+        const size_t local[2] = { TS, TS };
+        const size_t global[2] = { (size_t)M, (size_t)N };
         err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &event);
-
-        if (err != CL_SUCCESS) {
-            printf("ERROR: Failed to enqueue kernel! Error code: %d\n", err);
-            return 1;
-        }
-
-        // Wait for calculations to be finished
         clWaitForEvents(1, &event);
 
         auto run_end = std::chrono::high_resolution_clock::now();
@@ -214,38 +122,22 @@ int main(int argc, char* argv[]) {
         if (t > max_time) max_time = t;
     }
 
-    // Calculate advanced statistics
     double avg_time = total_time / (double)NUM_RUNS;
     double operations = (double)K * (double)M * (double)N * 2.0;
 
     double avg_gflop = operations / (1000.0*1000.0*1000.0 * avg_time);
-    double min_gflop = operations / (1000.0*1000.0*1000.0 * max_time); // slowest run
-    double max_gflop = operations / (1000.0*1000.0*1000.0 * min_time); // fastest run
+    double min_gflop = operations / (1000.0*1000.0*1000.0 * max_time);
+    double max_gflop = operations / (1000.0*1000.0*1000.0 * min_time);
     double spread = (max_gflop - min_gflop) / 2.0;
 
     printf(">>> Done: took %.6lf seconds per run\n", avg_time);
     printf(">>> Performance: %.1lf GFLOPS (±%.1lf GFLOPS)\n", avg_gflop, spread);
     printf(">>> Details: [Min: %.1lf, Max: %.1lf]\n", min_gflop, max_gflop);
 
-    // Copy the output matrix C back to the CPU memory
-    clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
+    clReleaseMemObject(bufA); clReleaseMemObject(bufB); clReleaseMemObject(bufC);
+    clReleaseCommandQueue(queue); clReleaseContext(context);
+    clReleaseProgram(program); clReleaseKernel(kernel);
+    free(A); free(B); free(C);
 
-    // Free the OpenCL memory objects
-    clReleaseMemObject(bufA);
-    clReleaseMemObject(bufB);
-    clReleaseMemObject(bufC);
-
-    // Clean-up OpenCL
-    clReleaseCommandQueue(queue);
-    clReleaseContext(context);
-    clReleaseProgram(program);
-    clReleaseKernel(kernel);
-
-    // Free the host memory objects
-    free(A);
-    free(B);
-    free(C);
-
-    // Exit
     return 0;
 }
