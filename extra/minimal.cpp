@@ -20,10 +20,13 @@
 #define NUM_RUNS 10
 #define SIZE 4096
 #define TS 16
+#define WPT 8
 
 const char *kernelstring =
     "#define TS 16\n"
-    "__kernel void myGEMM2(const int M, const int N, const int K,"
+    "#define WPT 8\n"
+    "#define RTS (TS/WPT)\n"
+    "__kernel void myGEMM4(const int M, const int N, const int K,"
     "                      const __global float* A,"
     "                      const __global float* B,"
     "                      __global float* C) {"
@@ -33,20 +36,29 @@ const char *kernelstring =
     "    const int globalCol = TS*get_group_id(1) + col;"
     "    __local float Asub[TS][TS];"
     "    __local float Bsub[TS][TS];"
-    "    float acc = 0.0f;"
+    "    float acc[WPT];"
+    "    for (int w=0; w<WPT; w++) {"
+    "        acc[w] = 0.0f;"
+    "    }"
     "    const int numTiles = K/TS;"
     "    for (int t=0; t<numTiles; t++) {"
-    "        const int tiledRow = TS*t + row;"
-    "        const int tiledCol = TS*t + col;"
-    "        Asub[col][row] = A[tiledCol*M + globalRow];"
-    "        Bsub[col][row] = B[globalCol*K + tiledRow];"
+    "        for (int w=0; w<WPT; w++) {"
+    "            const int tiledRow = TS*t + row;"
+    "            const int tiledCol = TS*t + col + w*RTS;"
+    "            Asub[col + w*RTS][row] = A[(tiledCol)*M + globalRow];"
+    "            Bsub[col + w*RTS][row] = B[(globalCol + w*RTS)*K + tiledRow];"
+    "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
     "        for (int k=0; k<TS; k++) {"
-    "            acc += Asub[k][row] * Bsub[col][k];"
+    "            for (int w=0; w<WPT; w++) {"
+    "                acc[w] += Asub[k][row] * Bsub[col + w*RTS][k];"
+    "            }"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
     "    }"
-    "    C[globalCol*M + globalRow] = acc;"
+    "    for (int w=0; w<WPT; w++) {"
+    "        C[(globalCol + w*RTS)*M + globalRow] = acc[w];"
+    "    }"
     "}";
 
 int main(int argc, char* argv[]) {
@@ -105,7 +117,7 @@ int main(int argc, char* argv[]) {
     clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, (size_t)K*(size_t)N*sizeof(float), B, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
-    cl_kernel kernel = clCreateKernel(program, "myGEMM2", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM4", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
@@ -122,8 +134,8 @@ int main(int argc, char* argv[]) {
     for (int r=0; r<NUM_RUNS; r++) {
         auto run_start = std::chrono::high_resolution_clock::now();
 
-        const size_t local[2] = { TS, TS };
-        const size_t global[2] = { (size_t)M, (size_t)N };
+        const size_t local[2] = { TS, (size_t)(TS / WPT) };
+        const size_t global[2] = { (size_t)M, (size_t)(N / WPT) };
         err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &event);
         clWaitForEvents(1, &event);
 
