@@ -5,11 +5,7 @@
 // File information:
 // Institution.... SURFsara <www.surfsara.nl>
 // Author......... Cedric Nugteren <cedric.nugteren@surfsara.nl>
-// Changed at..... 2014-11-07
 // License........ MIT license
-//
-// Compilation example:
-// g++ -O3 -Wall -std=c++11 extra/minimal.cpp -o bin/minimal -lOpenCL
 // =================================================================================================
 
 #include <stdio.h>
@@ -18,97 +14,71 @@
 #include <CL/cl.h>
 
 #define NUM_RUNS 10
-#define SIZE 4096
 
-// --- 2D Register Blocking + Local Register Caching Parameters ---
-#define TS 32
-#define WPT 4
+// --- NON-POWER-OF-TWO SIZES FOR TESTING ---
+#define SIZE_M 4097
+#define SIZE_N 4000
+#define SIZE_K 4096
+
+#define TS 16
+#define WPT 8
 #define RTS (TS/WPT)
 
 const char *kernelstring =
-    "#define TS 32\n"
-    "#define WPT 4\n"
+    "#define TS 16\n"
+    "#define WPT 8\n"
     "#define RTS (TS/WPT)\n"
-    "__kernel void myGEMM7(const int M, const int N, const int K,"
-    "                      const __global float* A,"
-    "                      const __global float* B,"
-    "                      __global float* C) {"
+    "__kernel void myGEMM10(const int M, const int N, const int K,"
+    "                       const __global float* A,"
+    "                       const __global float* B,"
+    "                       __global float* C) {"
     "    const int row = get_local_id(0);"
     "    const int col = get_local_id(1);"
     "    const int globalRow = TS*get_group_id(0) + row;"
     "    const int globalCol = TS*get_group_id(1) + col;"
     "    __local float Asub[TS][TS];"
     "    __local float Bsub[TS][TS];"
-    "    float acc[WPT][WPT];"
-    "    \n"
-    "    // Initialise the accumulation registers\n"
-    "    for (int wm=0; wm<WPT; wm++) {"
-    "        for (int wn=0; wn<WPT; wn++) {"
-    "            acc[wm][wn] = 0.0f;"
-    "        }"
-    "    }\n"
-    "    const int numTiles = K/TS;"
+    "    float acc[WPT];"
+    "    for (int w=0; w<WPT; w++) {"
+    "        acc[w] = 0.0f;"
+    "    }"
+    "    const int numTiles = (K + TS - 1)/TS;"
     "    for (int t=0; t<numTiles; t++) {"
-    "        // Load the current tile into local memory\n"
-    "        for (int wm=0; wm<WPT; wm++) {"
-    "            for (int wn=0; wn<WPT; wn++) {"
-    "                Asub[col + wn*RTS][row + wm*RTS] = A[(TS*t + col + wn*RTS)*M + globalRow + wm*RTS];"
-    "                Bsub[col + wn*RTS][row + wm*RTS] = B[(globalCol + wn*RTS)*K + TS*t + row + wm*RTS];"
+    "        for (int w=0; w<WPT; w++) {"
+    "            const int tiledRow = TS*t + row;"
+    "            const int tiledCol = TS*t + col + w*RTS;"
+    "            // Boundary checks for arbitrary sizes\n"
+    "            if (tiledCol < K && globalRow < M) {"
+    "                Asub[col + w*RTS][row] = A[(tiledCol)*M + globalRow];"
+    "            } else {"
+    "                Asub[col + w*RTS][row] = 0.0f;"
+    "            }"
+    "            if ((globalCol + w*RTS) < N && tiledRow < K) {"
+    "                Bsub[col + w*RTS][row] = B[(globalCol + w*RTS)*K + tiledRow];"
+    "            } else {"
+    "                Bsub[col + w*RTS][row] = 0.0f;"
     "            }"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
-    "        \n"
-    "        // Perform the MAC operations with explicit register caching\n"
     "        for (int k=0; k<TS; k++) {"
-    "            float a_reg[WPT];\n"
-    "            float b_reg[WPT];\n"
-    "            \n"
-    "            // Read from local memory to private registers ONLY ONCE per k\n"
-    "            a_reg[0] = Asub[k][row + 0*RTS];\n"
-    "            a_reg[1] = Asub[k][row + 1*RTS];\n"
-    "            a_reg[2] = Asub[k][row + 2*RTS];\n"
-    "            a_reg[3] = Asub[k][row + 3*RTS];\n"
-    "            \n"
-    "            b_reg[0] = Bsub[col + 0*RTS][k];\n"
-    "            b_reg[1] = Bsub[col + 1*RTS][k];\n"
-    "            b_reg[2] = Bsub[col + 2*RTS][k];\n"
-    "            b_reg[3] = Bsub[col + 3*RTS][k];\n"
-    "            \n"
-    "            // 16 Explicit MAC operations entirely in registers\n"
-    "            acc[0][0] += a_reg[0] * b_reg[0];\n"
-    "            acc[0][1] += a_reg[0] * b_reg[1];\n"
-    "            acc[0][2] += a_reg[0] * b_reg[2];\n"
-    "            acc[0][3] += a_reg[0] * b_reg[3];\n"
-    "            \n"
-    "            acc[1][0] += a_reg[1] * b_reg[0];\n"
-    "            acc[1][1] += a_reg[1] * b_reg[1];\n"
-    "            acc[1][2] += a_reg[1] * b_reg[2];\n"
-    "            acc[1][3] += a_reg[1] * b_reg[3];\n"
-    "            \n"
-    "            acc[2][0] += a_reg[2] * b_reg[0];\n"
-    "            acc[2][1] += a_reg[2] * b_reg[1];\n"
-    "            acc[2][2] += a_reg[2] * b_reg[2];\n"
-    "            acc[2][3] += a_reg[2] * b_reg[3];\n"
-    "            \n"
-    "            acc[3][0] += a_reg[3] * b_reg[0];\n"
-    "            acc[3][1] += a_reg[3] * b_reg[1];\n"
-    "            acc[3][2] += a_reg[3] * b_reg[2];\n"
-    "            acc[3][3] += a_reg[3] * b_reg[3];\n"
+    "            for (int w=0; w<WPT; w++) {"
+    "                acc[w] += Asub[k][row] * Bsub[col + w*RTS][k];"
+    "            }"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
-    "    }\n"
-    "    // Store the results\n"
-    "    for (int wm=0; wm<WPT; wm++) {"
-    "        for (int wn=0; wn<WPT; wn++) {"
-    "            C[(globalCol + wn*RTS)*M + globalRow + wm*RTS] = acc[wm][wn];"
+    "    }"
+    "    for (int w=0; w<WPT; w++) {"
+    "        // Final boundary check before writing to C\n"
+    "        if ((globalCol + w*RTS) < N && globalRow < M) {"
+    "            C[(globalCol + w*RTS)*M + globalRow] = acc[w];"
     "        }"
     "    }"
     "}";
 
 int main(int argc, char* argv[]) {
-    int K = SIZE;
-    int M = SIZE;
-    int N = SIZE;
+    int M = SIZE_M;
+    int N = SIZE_N;
+    int K = SIZE_K;
 
     float* A = (float*)malloc((size_t)M*(size_t)K*sizeof(float));
     float* B = (float*)malloc((size_t)K*(size_t)N*sizeof(float));
@@ -161,7 +131,7 @@ int main(int argc, char* argv[]) {
     clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, (size_t)K*(size_t)N*sizeof(float), B, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
-    cl_kernel kernel = clCreateKernel(program, "myGEMM7", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM10", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
@@ -169,7 +139,7 @@ int main(int argc, char* argv[]) {
     clSetKernelArg(kernel, 4, sizeof(cl_mem), (void*)&bufB);
     clSetKernelArg(kernel, 5, sizeof(cl_mem), (void*)&bufC);
 
-    printf(">>> Starting %d myGEMM runs...\n", NUM_RUNS);
+    printf(">>> Starting %d myGEMM runs with sizes M=%d, N=%d, K=%d...\n", NUM_RUNS, M, N, K);
 
     double total_time = 0.0;
     double min_time = 1e9;
@@ -178,8 +148,13 @@ int main(int argc, char* argv[]) {
     for (int r=0; r<NUM_RUNS; r++) {
         auto run_start = std::chrono::high_resolution_clock::now();
 
-        const size_t local[2] = { (size_t)RTS, (size_t)RTS };
-        const size_t global[2] = { (size_t)(M / WPT), (size_t)(N / WPT) };
+        const size_t local[2] = { TS, (size_t)(TS / WPT) };
+        // Padding global size to match local group dimensions
+        size_t threads_y = (N + WPT - 1) / WPT;
+        const size_t global[2] = {
+            ((M + TS - 1) / TS) * TS,
+            ((threads_y + local[1] - 1) / local[1]) * local[1]
+        };
 
         err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &event);
         if (err != CL_SUCCESS) {
