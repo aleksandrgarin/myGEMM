@@ -22,15 +22,29 @@
 #define TS 16
 
 const char *kernelstring =
-    "__kernel void myGEMM1(const int M, const int N, const int K,"
+    "#define TS 16\n"
+    "__kernel void myGEMM2(const int M, const int N, const int K,"
     "                      const __global float* A,"
     "                      const __global float* B,"
     "                      __global float* C) {"
-    "    const int globalRow = get_global_id(0);"
-    "    const int globalCol = get_global_id(1);"
+    "    const int row = get_local_id(0);"
+    "    const int col = get_local_id(1);"
+    "    const int globalRow = TS*get_group_id(0) + row;"
+    "    const int globalCol = TS*get_group_id(1) + col;"
+    "    __local float Asub[TS][TS];"
+    "    __local float Bsub[TS][TS];"
     "    float acc = 0.0f;"
-    "    for (int k=0; k<K; k++) {"
-    "        acc += A[k*M + globalRow] * B[globalCol*K + k];"
+    "    const int numTiles = K/TS;"
+    "    for (int t=0; t<numTiles; t++) {"
+    "        const int tiledRow = TS*t + row;"
+    "        const int tiledCol = TS*t + col;"
+    "        Asub[col][row] = A[tiledCol*M + globalRow];"
+    "        Bsub[col][row] = B[globalCol*K + tiledRow];"
+    "        barrier(CLK_LOCAL_MEM_FENCE);"
+    "        for (int k=0; k<TS; k++) {"
+    "            acc += Asub[k][row] * Bsub[col][k];"
+    "        }"
+    "        barrier(CLK_LOCAL_MEM_FENCE);"
     "    }"
     "    C[globalCol*M + globalRow] = acc;"
     "}";
@@ -91,7 +105,7 @@ int main(int argc, char* argv[]) {
     clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, (size_t)K*(size_t)N*sizeof(float), B, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
-    cl_kernel kernel = clCreateKernel(program, "myGEMM1", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM2", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
