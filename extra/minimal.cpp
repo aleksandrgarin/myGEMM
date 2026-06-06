@@ -26,7 +26,7 @@ const char *kernelstring =
     "#define TS 16\n"
     "#define WPT 8\n"
     "#define RTS (TS/WPT)\n"
-    "__kernel void myGEMM4(const int M, const int N, const int K,"
+    "__kernel void myGEMM5(const int M, const int N, const int K,"
     "                      const __global float* A,"
     "                      const __global float* B,"
     "                      __global float* C) {"
@@ -35,7 +35,8 @@ const char *kernelstring =
     "    const int globalRow = TS*get_group_id(0) + row;"
     "    const int globalCol = TS*get_group_id(1) + col;"
     "    __local float Asub[TS][TS];"
-    "    __local float Bsub[TS][TS];"
+    "    // Искусственный сдвиг (padding) на 1 элемент для устранения Bank Conflicts\n"
+    "    __local float Bsub[TS][TS + 1];"
     "    float acc[WPT];"
     "    for (int w=0; w<WPT; w++) {"
     "        acc[w] = 0.0f;"
@@ -46,12 +47,14 @@ const char *kernelstring =
     "            const int tiledRow = TS*t + row;"
     "            const int tiledCol = TS*t + col + w*RTS;"
     "            Asub[col + w*RTS][row] = A[(tiledCol)*M + globalRow];"
-    "            Bsub[col + w*RTS][row] = B[(globalCol + w*RTS)*K + tiledRow];"
+    "            // Транспонирование B: записываем в [row][col], а не [col][row]\n"
+    "            Bsub[row][col + w*RTS] = B[(globalCol + w*RTS)*K + tiledRow];"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
     "        for (int k=0; k<TS; k++) {"
     "            for (int w=0; w<WPT; w++) {"
-    "                acc[w] += Asub[k][row] * Bsub[col + w*RTS][k];"
+    "                // Теперь считываем Bsub по строкам [k][col], что гораздо быстрее\n"
+    "                acc[w] += Asub[k][row] * Bsub[k][col + w*RTS];"
     "            }"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
@@ -117,7 +120,7 @@ int main(int argc, char* argv[]) {
     clEnqueueWriteBuffer(queue, bufB, CL_TRUE, 0, (size_t)K*(size_t)N*sizeof(float), B, 0, NULL, NULL);
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
-    cl_kernel kernel = clCreateKernel(program, "myGEMM4", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM5", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
