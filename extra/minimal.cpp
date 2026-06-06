@@ -28,13 +28,16 @@
 
 // Threadblock sizes (e.g. for kernels myGEMM1 or myGEMM2)
 #define TS 16 // Set to 16 for AMD compatibility
+#define WPT 8 // Work Per Thread
 
 // =================================================================================================
 
 // Set the kernel as a string
 const char *kernelstring =
     "#define TS 16\n"
-    "__kernel void myGEMM2(const int M, const int N, const int K,"
+    "#define WPT 8\n"
+    "#define RTS (TS/WPT)\n"
+    "__kernel void myGEMM3(const int M, const int N, const int K,"
     "                      const __global float* A,"
     "                      const __global float* B,"
     "                      __global float* C) {"
@@ -44,20 +47,29 @@ const char *kernelstring =
     "    const int globalCol = TS*get_group_id(1) + col;"
     "    __local float Asub[TS][TS];"
     "    __local float Bsub[TS][TS];"
-    "    float acc = 0.0f;"
+    "    float acc[WPT];"
+    "    for (int w=0; w<WPT; w++) {"
+    "        acc[w] = 0.0f;"
+    "    }"
     "    const int numTiles = K/TS;"
     "    for (int t=0; t<numTiles; t++) {"
-    "        const int tiledRow = TS*t + row;"
-    "        const int tiledCol = TS*t + col;"
-    "        Asub[col][row] = A[tiledCol*M + globalRow];"
-    "        Bsub[col][row] = B[globalCol*K + tiledRow];"
+    "        for (int w=0; w<WPT; w++) {"
+    "            const int tiledRow = TS*t + row;"
+    "            const int tiledCol = TS*t + col + w*RTS;"
+    "            Asub[col + w*RTS][row] = A[(tiledCol)*M + globalRow];"
+    "            Bsub[col + w*RTS][row] = B[(globalCol + w*RTS)*K + tiledRow];"
+    "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
     "        for (int k=0; k<TS; k++) {"
-    "            acc += Asub[k][row] * Bsub[col][k];"
+    "            for (int w=0; w<WPT; w++) {"
+    "                acc[w] += Asub[k][row] * Bsub[col + w*RTS][k];"
+    "            }"
     "        }"
     "        barrier(CLK_LOCAL_MEM_FENCE);"
     "    }"
-    "    C[globalCol*M + globalRow] = acc;"
+    "    for (int w=0; w<WPT; w++) {"
+    "        C[(globalCol + w*RTS)*M + globalRow] = acc[w];"
+    "    }"
     "}";
 
 // =================================================================================================
@@ -161,7 +173,7 @@ int main(int argc, char* argv[]) {
     clEnqueueWriteBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
 
     // Configure the myGEMM kernel and set its arguments
-    cl_kernel kernel = clCreateKernel(program, "myGEMM2", &err);
+    cl_kernel kernel = clCreateKernel(program, "myGEMM3", &err);
     clSetKernelArg(kernel, 0, sizeof(int), (void*)&M);
     clSetKernelArg(kernel, 1, sizeof(int), (void*)&N);
     clSetKernelArg(kernel, 2, sizeof(int), (void*)&K);
@@ -172,14 +184,17 @@ int main(int argc, char* argv[]) {
     // Start the timed loop
     printf(">>> Starting %d myGEMM runs...\n", NUM_RUNS);
 
-    // Start the high-resolution C++11 timer
-    auto start = std::chrono::high_resolution_clock::now();
+    double total_time = 0.0;
+    double min_time = 1e9;
+    double max_time = 0.0;
 
     for (int r=0; r<NUM_RUNS; r++) {
 
+        auto run_start = std::chrono::high_resolution_clock::now();
+
         // Run the myGEMM kernel
-        const size_t local[2] = { TS, TS };
-        const size_t global[2] = { (size_t)M, (size_t)N };
+        const size_t local[2] = { TS, (size_t)(TS / WPT) };
+        const size_t global[2] = { (size_t)M, (size_t)(N / WPT) };
         err = clEnqueueNDRangeKernel(queue, kernel, 2, NULL, global, local, 0, NULL, &event);
 
         if (err != CL_SUCCESS) {
@@ -189,17 +204,28 @@ int main(int argc, char* argv[]) {
 
         // Wait for calculations to be finished
         clWaitForEvents(1, &event);
+
+        auto run_end = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> diff = run_end - run_start;
+        double t = diff.count();
+
+        total_time += t;
+        if (t < min_time) min_time = t;
+        if (t > max_time) max_time = t;
     }
 
-    // End the timed loop
-    auto end = std::chrono::high_resolution_clock::now();
+    // Calculate advanced statistics
+    double avg_time = total_time / (double)NUM_RUNS;
+    double operations = (double)K * (double)M * (double)N * 2.0;
 
-    // Calculate the elapsed time in seconds with high precision
-    std::chrono::duration<double> diff = end - start;
-    double runtime = diff.count() / (double)NUM_RUNS;
+    double avg_gflop = operations / (1000.0*1000.0*1000.0 * avg_time);
+    double min_gflop = operations / (1000.0*1000.0*1000.0 * max_time); // slowest run
+    double max_gflop = operations / (1000.0*1000.0*1000.0 * min_time); // fastest run
+    double spread = (max_gflop - min_gflop) / 2.0;
 
-    double gflop = ((long)K * (long)M * (long)N * 2) / (1000.0*1000.0*1000.0);
-    printf(">>> Done: took %.6lf seconds per run, %.1lf GFLOPS\n", runtime, gflop/runtime);
+    printf(">>> Done: took %.6lf seconds per run\n", avg_time);
+    printf(">>> Performance: %.1lf GFLOPS (±%.1lf GFLOPS)\n", avg_gflop, spread);
+    printf(">>> Details: [Min: %.1lf, Max: %.1lf]\n", min_gflop, max_gflop);
 
     // Copy the output matrix C back to the CPU memory
     clEnqueueReadBuffer(queue, bufC, CL_TRUE, 0, (size_t)M*(size_t)N*sizeof(float), C, 0, NULL, NULL);
