@@ -1,61 +1,66 @@
+# Оптимизация ядер SGEMM на архитектуре AMD RDNA3 (OpenCL)
 
-Exploring the performance of SGEMM in OpenCL on NVIDIA GPUs
-=============
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![OpenCL](https://img.shields.io/badge/OpenCL-3.0-blue.svg)](https://www.khronos.org/opencl/)
+[![Platform](https://img.shields.io/badge/Platform-AMD_ROCm-red.svg)]()
 
-Date: 31-Oct-2014 - 07-Nov-2014
+## Описание проекта
+Данный репозиторий содержит результаты исследования и пошаговой оптимизации алгоритма общего матричного умножения (SGEMM) одинарной точности с использованием фреймворка OpenCL. Проект основан на туториале Седрика Нугтерена.
 
-Author: Cedric Nugteren, SURFsara (http://www.surfsara.nl)
+В отличие от большинства реализаций, ориентированных на дискретные видеокарты NVIDIA (CUDA/Kepler), **данный проект сфокусирован на анализе производительности интегрированных графических процессоров (APU) компании AMD**. В ходе работы был реализован ряд архитектурно-зависимых оптимизаций, выявлены критические узкие места подсистемы памяти AMD RDNA3 и написан автоматизированный скрипт для поиска оптимальных параметров конфигурации.
 
-This repository contains multiple OpenCL implementations of single-precision generalised matrix-multiplication (SGEMM) tuned for an NVIDIA Tesla K40m GPU. The different versions (named myGEMM) are part of a step-by-step tutorial, in which each step adds a new optimisation. The different steps and the details of the OpenCL kernel codes are all explained in depth at https://cnugteren.github.io/tutorial/pages/page1.html.
+## Конфигурация стенда и методология
 
-The OpenCL kernels can be used natively using the OpenCL framework. However, there is also a header-file included which converts the OpenCL kernels into CUDA syntax. This allows the same code to be tested through the CUDA-toolchain.
+### Аппаратное и программное обеспечение
+* **Процессор:** AMD Ryzen 5 7640HS (6 ядер / 12 потоков)
+* **Графический процессор:** AMD Radeon 760M Graphics (архитектура RDNA3, `gfx1103`)
+* **Платформа выполнения:** AMD ROCm OpenCL 3.0 Runtime
+* **Компилятор:** GCC (g++) с флагами `-O3 -Wall -std=c++11`
 
-Apart from the OpenCL kernel codes, this repository contains fully working host code, including a loop over different matrix sizes and different BLAS libraries. It contains code to run NVIDIA's cuBLAS as a reference and the open-source clBlas library.
+### Методология измерений
+Для получения статистически достоверных результатов SGEMM была применена следующая процедура профилирования:
+1. **Размер матриц:** Тестирование базовых ядер проводилось на матрицах `4096 x 4096` (Ядро 10 тестировалось на неквадратной матрице `4097 x 4000 x 4096`).
+2. **Итеративность:** Каждое ядро выполнялось **10 раз подряд** для минимизации влияния планировщика ОС и температурного троттлинга.
+3. **Метрики:** Для каждого этапа фиксировалось среднее время выполнения, пиковая производительность (GFLOPS) и математический разброс (Spread/Погрешность) между минимальным и максимальным значением.
 
-Pre-requisites:
-* A C++ compiler (tested with GCC and ICC)
-* The CUDA toolkit and NVCC compiler (tested with version 6.5)
-* OpenCL headers and libraries (part of the CUDA toolkit)
+## Этапы оптимизации SGEMM (Результаты)
 
-Requirements to run the performance and correctness comparisons:
-* The cuBLAS library (part of the CUDA toolkit, tested version 6.5)
-* The open-source clBlas library (tested 2.2.0)
+| Тип ядра / Оптимизация | Время выполнения (с) | GFLOPS (Среднее) | Разброс | Описание механизма |
+| :--- | :---: | :---: | :---: | :--- |
+| **Ядро 1 (Naive)** | ~3.626 | **37.9** | ±0.2 | Базовая наивная реализация |
+| **Ядро 2 (LDS Tiling)** | ~0.521 | **263.4** | ±14.5 | Использование разделяемой локальной памяти |
+| **Ядро 3 (1D WPT)** | ~0.303 | **452.7** | ±29.4 | Увеличение объема работы на один поток |
+| **Ядро 4 (Vector)** | ~0.297 | **461.2** | ±30.1 | Аппаратная векторизация инструкций |
+| **Ядро 5 (Padding)** | ~0.460 | **298.4** | ±15.1 | Сдвиг памяти (*Выявлена регрессия*) |
+| **Ядро 6 (2D Block)** | ~0.323 | **425.4** | ±36.2 | Двумерное блокирование регистров |
+| **Ядро 7 (Caching)** | ~0.310 | **443.2** | ±38.0 | Кэширование локальной памяти |
+| **Ядро 10 (Universal)** | ~0.424 | **316.0** | ±15.0 | Универсальное ядро с граничными проверками |
 
-Usage
-=============
+*(Визуализация эволюции производительности доступна в директории `results/`)*
 
-*	Compile the code:
+### Архитектурные особенности AMD RDNA3 (Сравнительный анализ)
+Результаты экспериментов выявили резкое отличие поведения архитектуры AMD от стандартных GPU NVIDIA:
+1. **Аппаратная регрессия метода Padding (Ядро 5):** Введение искусственного отступа (`TS+1`) для устранения конфликтов банков памяти (Bank Conflicts), которое дает огромный прирост на картах NVIDIA, на архитектуре AMD привело к **падению производительности на 35%** (до 298.4 GFLOPS).
+2. **Давление на регистры (Register Pressure):** Выделение двумерного массива регистров в Ядре 6 вызвало снижение количества активных потоков из-за физической нехватки регистрового файла на GPU, что не позволило превзойти результаты Ядра 4.
 
-		make build
+## Автоматический подбор параметров (Auto-Tuning)
 
-	Compiles the benchmarking infrastructure and the myGEMM kernels. Make sure there is a "bin" and "obj" directory available. Note that you might have to edit the Makefile to set the proper locations of the CUDA and OpenCL installations on your system.
+Для нахождения аппаратного максимума был написан bash-скрипт `extra/tuner.sh`, который динамически подставляет параметры `TS` (Tile Size) и `WPT` (Work-Per-Thread) в исходный код OpenCL-ядра (Ядро 4).
 
-*	Run the code:
+| TS | WPT | GFLOPS | Разброс | Статус |
+| :---: | :---: | :---: | :---: | :--- |
+| 16 | 4 | 462.7 | ±50.8 | Базовая стабильная конфигурация |
+| 16 | 8 | 474.0 | ±31.2 | Эффективное использование кэша |
+| **32** | **4** | **477.0** | **±45.1** | **Аппаратный оптимум (Sweet Spot)** |
+| 32 | 8 | 433.9 | ±37.2 | Переполнение регистрового файла (Spilling) |
 
-		make run
+**Вывод:** В отличие от дефолтных настроек туториала, для Radeon 760M идеальным балансом является конфигурация `TS=32, WPT=4`, выдающая 477 GFLOPS.
 
-	This runs the code for matrices ranging from MINSIZE to MAXSIZE (defined in src/common.h). It will run cuBLAS, clBlas, and the CUDA and OpenCL versions of the myGEMM kernels. The particular kernel to be executed is defined using the KERNEL keyword in src/settings.h. This file also contains other settings you might want to modify for your particular GPU.
+## Инструкция по сборке
 
-*	Inspect the code:
+Проект спроектирован так, чтобы компилироваться напрямую через C++ компилятор без сложных сборочных систем. Минимальный рабочий пример (MWE) и скрипт профилирования находятся в папке `extra`.
 
-		make inspect
-
-	This generates all kinds of assembly-like versions of the CUDA kernels in the "bin" subdirectory. It also prints out statistics of the kernels such as the register usage.
-
-Minimal working example
-=============
-
-Additionally, we supply the minimal.cpp file in the 'extra' directory. This file is a self-contained minimal working example (MWE) of the most basic SGEMM kernel (myGEMM1). This can be useful if you don't want to deal with Makefiles or don't have the CUDA, cuBLAS, or clBlas installed. Note that minimal.cpp misses some features compared to the main code, but we believe that it can nevertheless be a good starting point if you want to integrate myGEMM into your own code.
-
-The code can be compiled using a regular C++ compiler and only requires OpenCL installed. Example compilation from the root folder:
-
-	g++ -O3 -Wall -I/path/to/opencl/include extra/minimal.cpp -o bin/minimal -lOpenCL
-
-Be aware that the minimal working example does not:
-*	Iterate over multiple matrix sizes
-*	Compare performance with cuBLAS or clBlas
-*	Check for correctness of the results
-*	Check for OpenCL errors
-*	Load a kernel-file from disk, instead it is embedded as a string
-
-###################################################
+**1. Сборка и запуск финального ядра:**
+```bash
+g++ -O3 -Wall -std=c++11 extra/minimal.cpp -o bin/minimal -lOpenCL
+./bin/minimal
